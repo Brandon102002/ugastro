@@ -19,14 +19,14 @@ data_buffer = []
 terminate_flag = threading.Event()
 
 # ======= CONFIG ======= #
-FOLDER = "//Section3//"
+FOLDER = "//Lab3Data//Week1_Testing//"
 OBS_NAME = "test_observation"
 OBS_TIME = 3600 # seconds
 RA = 180 # degrees
 DEC = 45 # degrees
 OBS_SUN = False # Bool to measure sun instead of specific coords
 
-DATA_FILE = os.path.join(FOLDER, f"{OBS_NAME}_data.npy")
+DATA_FILE = os.path.join(FOLDER, f"{OBS_NAME}_data.npz")
 LOG_FILE = os.path.join(FOLDER, f"{OBS_NAME}_log.json")
 
 # ======= CONFIG ======= #
@@ -130,3 +130,5 @@ with data_lock:
         log_message("Final data saved successfully.")
 
 log_message("Data collection completed.")
+
+ifm.stow()
