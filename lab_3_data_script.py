@@ -2,32 +2,47 @@ import threading
 import time
 import json
 import ugradio
-from interf import Interferometer
-from snap import UGRadioSnap
-from sdr import SDR, capture_data
-from coord import get_altaz, sunpos
+import os
+from ugradio.interf import Interferometer
+from snap_spec.snap import UGRadioSnap
+from ugradio.sdr import SDR, capture_data
+from ugradio.coord import get_altaz, sunpos, precess
+from ugradio.timing import local_time, utc, julian_date, lst
 import numpy as np
 
-print("Local Time:", ugradio.timing.local_time())
-print("UTC Time:", ugradio.timing.utc())
-print("Unix Time:", ugradio.timing.unix_time())
-print("Julian Date:", ugradio.timing.julian_date())
-print("Local Sidereal Time (LST):", ugradio.timing.lst())
-
-# Initialize components
-interf = Interferometer()
-snap = UGRadioSnap()
-DATA_FILE = "observations.json"
+# ======= INITIALIZE ======= #
+ifm = Interferometer()
+snap = UGRadioSnap(host='localhost', is_discover=True)
+snap.initialize(mode='corr', sample_rate=500)
 data_lock = threading.Lock()
-collected_data = []
+data_buffer = []
 terminate_flag = threading.Event()
+
+# ======= CONFIG ======= #
+FOLDER = "//Section3//"
+OBS_NAME = "test_observation"
+OBS_TIME = 3600 # seconds
+RA = 180 # degrees
+DEC = 45 # degrees
+OBS_SUN = False # Bool to measure sun instead of specific coords
+
+DATA_FILE = os.path.join(FOLDER, f"{OBS_NAME}_data.npy")
+LOG_FILE = os.path.join(FOLDER, f"{OBS_NAME}_log.json")
+
+# ======= CONFIG ======= #
+def log_message(message):
+    """Write log messages to the log file."""
+    timestamp = utc()
+    log_entry = f"[{timestamp}] {message}\n"
+    with open(LOG_FILE, "a") as log:
+        log.write(log_entry)
 
 # ======= TELESCOPE POINTING ======= #
 def point_telescope(target_alt, target_az):
     """Continuously adjust telescope pointing."""
     try:
         while not terminate_flag.is_set():
-            interf.point(target_alt, target_az)
+            ifm.point(alt=target_alt, az=target_az, wait=True, verbose=True)
             print(f"Telescope pointed to Alt: {target_alt}, Az: {target_az}")
             time.sleep(5)
     except Exception as e:
@@ -44,25 +59,12 @@ def collect_spectrometer_data(duration):
             if "acc_cnt" in data:
                 prev_cnt = data["acc_cnt"]
                 with data_lock:
-                    collected_data.append({"time": ugradio.timing.utc(), "spectra": data})
+                    data_buffer.append(data)
+                log_message(f"Collected spectrometer data. Accumulator count: {prev_cnt}")
             time.sleep(1)
         print("Spectrometer finished collecting.")
     except Exception as e:
         print(f"Spectrometer error: {e}")
-
-def collect_sdr_data(nsamples, nblocks, duration):
-    """Collect data from SDR dongle."""
-    try:
-        sdr = SDR()
-        start_time = time.time()
-        while time.time() - start_time < duration and not terminate_flag.is_set():
-            sdr_data = sdr.capture_data(nsamples=nsamples, nblocks=nblocks)
-            with data_lock:
-                collected_data.append({"time": ugradio.timing.utc(), "sdr": sdr_data})
-            time.sleep(1)
-        print("SDR finished collecting.")
-    except Exception as e:
-        print(f"SDR error: {e}")
 
 # ======= DATA SAVING ======= #
 def save_data_periodically():
@@ -70,66 +72,61 @@ def save_data_periodically():
     try:
         while not terminate_flag.is_set():
             with data_lock:
-                with open(DATA_FILE, "w") as f:
-                    json.dump(collected_data, f, indent=4)
-            print("Data saved successfully.")
+                if data_buffer:
+                    np.save(DATA_FILE, np.array(data_buffer, dtype=object))
+                    log_message("Data saved successfully.")
             time.sleep(10)
     except Exception as e:
-        print(f"Error saving data: {e}")
+        log_message(f"Error saving data: {e}")
 
-# ======= USER INPUT ======= #
+
+# ======= SETUP ======= #
 try:
-    observe_sun = input("Observe the Sun? (yes/no): ").strip().lower() == "yes"
-    process_coords = not observe_sun and input("Process RA/Dec coordinates? (yes/no): ").strip().lower() == "yes"
-
-    if observe_sun:
-        jd = ugradio.timing.julian_date()
+    log_message("Initializing observation setup...")
+    jd = julian_date()
+    if OBS_SUN:
         ra, dec = sunpos(jd)
-        lat, lon, alt = 37.8716, -122.2727, 0  # Example location (Berkeley, CA)
-        target_alt, target_az = get_altaz(ra, dec, jd, lat, lon, alt)
-        print(f"Sun Position -> Alt: {target_alt:.2f}, Az: {target_az:.2f}")
-
-    elif process_coords:
-        ra = float(input("Enter RA (degrees): "))
-        dec = float(input("Enter Dec (degrees): "))
-        jd = time.time() / 86400.0 + 2440587.5
-        lat, lon, alt = 37.8716, -122.2727, 0
-        target_alt, target_az = get_altaz(ra, dec, jd, lat, lon, alt)
-
+        log_message("Observing the Sun")
     else:
-        target_alt = float(input("Enter Altitude (degrees): "))
-        target_az = float(input("Enter Azimuth (degrees): "))
-
-    nsamples = int(input("Enter samples per block: "))
-    nblocks = int(input("Enter number of blocks: "))
-    duration = float(input("Enter total duration (seconds): "))
-
+        ra, dec = precess(RA, DEC, jd)
+        log_message(f"Observing RA: {RA}, DEC: {DEC}")
+    alt, az = get_altaz(ra, dec, jd)
+    log_message(f"Computed Alt: {alt:.2f}, Az: {az:.2f}")
 except Exception as e:
     print(f"Input error: {e}")
     exit()
 
 # ======= START THREADS ======= #
-telescope_thread = threading.Thread(target=point_telescope, args=(target_alt, target_az))
-spectrometer_thread = threading.Thread(target=collect_spectrometer_data, args=(duration,))
-sdr_thread = threading.Thread(target=collect_sdr_data, args=(nsamples, nblocks, duration))
+telescope_thread = threading.Thread(target=point_telescope, args=(alt, az))
+spectrometer_thread = threading.Thread(target=collect_spectrometer_data, args=(OBS_TIME,))
 save_thread = threading.Thread(target=save_data_periodically)
 
-for t in [telescope_thread, spectrometer_thread, sdr_thread, save_thread]:
+for t in [telescope_thread, spectrometer_thread, save_thread]:
     t.daemon = True
     t.start()
 
 # ======= MAIN EXECUTION ======= #
 try:
     start_time = time.time()
-    while time.time() - start_time < duration:
+    log_message("Observation started.")
+    
+    while time.time() - start_time < OBS_TIME:
         time.sleep(1)
-    print("Time duration reached, waiting for last block to complete...")
+
+    log_message("Time duration reached, waiting for last block to complete...")
     terminate_flag.set()
+    
 except KeyboardInterrupt:
-    print("\nTerminating data collection...")
+    log_message("Observation terminated by user.")
     terminate_flag.set()
 except Exception as e:
-    print(f"Unexpected error: {e}")
+    log_message(f"Unexpected error: {e}")
     terminate_flag.set()
 
-print("Data collection completed.")
+log_message("Saving final dataset...")
+with data_lock:
+    if data_buffer:
+        np.save(DATA_FILE, np.array(data_buffer, dtype=object))
+        log_message("Final data saved successfully.")
+
+log_message("Data collection completed.")
